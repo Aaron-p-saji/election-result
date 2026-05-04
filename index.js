@@ -3,7 +3,8 @@ const { google } = require('googleapis');
 
 const SPREADSHEET_ID = '1dHBQs3lrndB83y24E-424AUfXUnfESzKZV8PYqMoDCc';
 const BIGTV_API = 'https://bigtv-election.onrender.com/api/candidates/results';
-const REPORTER_API = 'https://election.reporterlive.com/api/widget/election-2026/summary';
+const REPORTER_SUMMARY_API = 'https://election.reporterlive.com/api/widget/election-2026/summary';
+const REPORTER_CONSTITUENCY_BASE = 'https://election.reporterlive.com/api/widget/election-2026/constituency/';
 
 async function updateElectionSheet() {
     try {
@@ -14,40 +15,41 @@ async function updateElectionSheet() {
         });
         const sheets = google.sheets({ version: 'v4', auth });
 
-        // 1. Fetch BigTV Data (Malayalam matching)
-        console.log('Fetching BigTV results...');
-        const bigTvRes = await axios.get(BIGTV_API, {
-            headers: { 'Referer': 'https://electionresult.bigtv24x7.com/' }
-        });
+        // 1. Fetch BigTV Data (For Malayalam matching sheets)
+        const bigTvRes = await axios.get(BIGTV_API, { headers: { 'Referer': 'https://electionresult.bigtv24x7.com/' } });
         const bigTvMap = {};
         bigTvRes.data.forEach(c => {
-            if (c.leadingPosition === "LEADING") {
-                const mlName = (c.constituencyId.nameMl || "").trim();
-                bigTvMap[mlName] = c.partyNameEn;
-            }
+            if (c.leadingPosition === "LEADING") bigTvMap[c.constituencyId.nameMl.trim()] = c.partyNameEn;
         });
 
-        // 2. Fetch Reporter Live Data (English matching)
-        console.log('Fetching Reporter Live results...');
-        const reporterRes = await axios.get(REPORTER_API);
+        // 2. Fetch Reporter Live Data (For English matching sheet)
+        console.log('Fetching Reporter Live data...');
+        const reporterSummary = await axios.get(REPORTER_SUMMARY_API);
         const reporterMap = {};
+
+        // Reporter API structure: districts -> constituencies -> slug
+        const districts = reporterSummary.data.data.districts;
         
-        // Combining primary and secondary candidate sliders
-        const reporterCandidates = [
-            ...reporterRes.data.data.primary_slider, 
-            ...reporterRes.data.data.secondary_slider
-        ];
-
-        reporterCandidates.forEach(c => {
-            if (c.status === "leading") {
-                // Using constituency.name_en specifically for this sheet
-                const enName = (c.constituency.name_en || "").trim();
-                reporterMap[enName] = c.alliance;
+        for (const district of districts) {
+            for (const constInfo of district.constituencies) {
+                try {
+                    // Fetch detailed data for each slug to find the ACTUAL leader
+                    const detailRes = await axios.get(`${REPORTER_CONSTITUENCY_BASE}${constInfo.slug}`);
+                    const candidates = detailRes.data.data.candidates;
+                    
+                    // Find the one where status is "leading"
+                    const leader = candidates.find(cand => cand.status === "leading");
+                    if (leader) {
+                        reporterMap[constInfo.name_en.trim()] = leader.alliance;
+                    }
+                } catch (e) {
+                    console.error(`Could not fetch details for ${constInfo.slug}`);
+                }
             }
-        });
+        }
 
-        // 3. Helper function to process sheets
-        const updateSheetData = async (sheetName, liveMap) => {
+        // 3. Update Sheets
+        const updateSheet = async (sheetName, liveMap) => {
             const res = await sheets.spreadsheets.values.get({
                 spreadsheetId: SPREADSHEET_ID,
                 range: `${sheetName}!A2:G141`,
@@ -55,14 +57,11 @@ async function updateElectionSheet() {
             const rows = res.data.values;
             if (!rows) return;
 
-            let nikhilTotal = 0;
-            let janeTotal = 0;
+            let nikhilTotal = 0, janeTotal = 0;
 
             const updatedRows = rows.map(row => {
-                const constituencyInSheet = (row[1] || "").trim();
-                
-                // Get lead from map or keep current value in Column E
-                const actualWinner = liveMap[constituencyInSheet] || row[4] || "";
+                const nameInSheet = (row[1] || "").trim();
+                const actualWinner = liveMap[nameInSheet] || row[4] || "";
                 
                 const nikhilScore = (actualWinner && row[2] === actualWinner) ? 1 : 0;
                 const janeScore = (actualWinner && row[3] === actualWinner) ? 1 : 0;
@@ -73,7 +72,6 @@ async function updateElectionSheet() {
                 return [row[0], row[1], row[2], row[3], actualWinner, nikhilScore, janeScore];
             });
 
-            // Update main range
             await sheets.spreadsheets.values.update({
                 spreadsheetId: SPREADSHEET_ID,
                 range: `${sheetName}!A2`,
@@ -81,7 +79,6 @@ async function updateElectionSheet() {
                 resource: { values: updatedRows },
             });
 
-            // Update Total Points row
             await sheets.spreadsheets.values.update({
                 spreadsheetId: SPREADSHEET_ID,
                 range: `${sheetName}!F142:G142`,
@@ -90,18 +87,15 @@ async function updateElectionSheet() {
             });
         };
 
-        // 4. Execute Updates
-        // Update Malayalam sheets from BigTV
-        await updateSheetData('Full_Predictions', bigTvMap);
-        await updateSheetData('Differences', bigTvMap);
+        // Run updates
+        await updateSheet('Full_Predictions', bigTvMap);
+        await updateSheet('Differences', bigTvMap);
+        await updateSheet('REPORTER REPORT', reporterMap);
 
-        // Update English sheet from Reporter Live
-        await updateSheetData('REPORTER REPORT', reporterMap);
-
-        console.log('✅ All sheets updated successfully.');
+        console.log('✅ All reports updated based on current leaders.');
         process.exit(0);
     } catch (error) {
-        console.error('Update Failed:', error.message);
+        console.error('Workflow Error:', error.message);
         process.exit(1);
     }
 }
