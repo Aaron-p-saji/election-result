@@ -65,6 +65,8 @@ async function updateElectionSheet() {
                         return txt.includes('leading') || txt.includes('won');
                     });
 
+                    console.log(`ECI ini for ${constObj.id}`);
+
                     if (leadingBox.length > 0) {
                         const party = leadingBox.find('.nme-prty h6').text().trim();
                         if (party.includes('National Congress')) winnerAlliance = 'UDF';
