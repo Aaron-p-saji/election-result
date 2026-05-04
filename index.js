@@ -15,49 +15,47 @@ async function updateElectionSheet() {
         });
         const sheets = google.sheets({ version: 'v4', auth });
 
-        // 1. Fetch BigTV Data (For Malayalam matching sheets)
+        // 1. Fetch BigTV Data (Malayalam Matching)
+        console.log('Fetching BigTV results...');
         const bigTvRes = await axios.get(BIGTV_API, { headers: { 'Referer': 'https://electionresult.bigtv24x7.com/' } });
         const bigTvMap = {};
         bigTvRes.data.forEach(c => {
-            if (c.leadingPosition === "LEADING") bigTvMap[c.constituencyId.nameMl.trim()] = c.partyNameEn;
+            if (c.leadingPosition === "LEADING") {
+                const mlName = (c.constituencyId.nameMl || "").trim();
+                bigTvMap[mlName] = c.partyNameEn;
+            }
         });
 
-        // 2. Fetch Reporter Live Data (For English matching sheet)
+        // 2. Fetch Reporter Live Data (English Matching + Lead/Trail Logic)
         console.log('Fetching Reporter Live data...');
         const reporterSummary = await axios.get(REPORTER_SUMMARY_API);
         const reporterMap = {};
 
-        // Reporter API structure: districts -> constituencies -> slug
         const districts = reporterSummary.data.data.districts;
         
-        // Map live results to find BOTH leader and trailer
-const liveResultsMap = {};
+        for (const district of districts) {
+            for (const constInfo of district.constituencies) {
+                try {
+                    const detailRes = await axios.get(`${REPORTER_CONSTITUENCY_BASE}${constInfo.slug}`);
+                    const candidates = detailRes.data.data.candidates;
+                    
+                    const leader = candidates.find(cand => cand.status === "leading");
+                    const trailer = candidates.find(cand => cand.status === "trailing");
 
-for (const district of districts) {
-    for (const constInfo of district.constituencies) {
-        try {
-            const detailRes = await axios.get(`${REPORTER_CONSTITUENCY_BASE}${constInfo.slug}`);
-            const candidates = detailRes.data.data.candidates;
-            
-            // Find the candidate explicitly marked as "leading"
-            const leader = candidates.find(cand => cand.status === "leading");
-            // Find the candidate explicitly marked as "trailing"
-            const trailer = candidates.find(cand => cand.status === "trailing");
-
-            // Store both in the map for the constituency
-            reporterMap[constInfo.name_en.trim()] = {
-                leading: leader ? leader.alliance : "N/A",
-                trailing: trailer ? trailer.alliance : "N/A"
-            };
-        } catch (e) {
-            console.error(`Could not fetch details for ${constInfo.slug}`);
-        }
-    }
-}
+                    // Map specific for English Sheet
+                    reporterMap[constInfo.name_en.trim()] = {
+                        leading: leader ? leader.alliance : null,
+                        trailing: trailer ? trailer.alliance : null
+                    };
+                } catch (e) {
+                    console.error(`Could not fetch details for ${constInfo.slug}`);
+                }
+            }
         }
 
-        // 3. Update Sheets
-        const updateSheet = async (sheetName, liveMap) => {
+        // 3. Update Function
+        const updateSheet = async (sheetName, liveMap, isReporterSheet) => {
+            console.log(`Processing sheet: ${sheetName}`);
             const res = await sheets.spreadsheets.values.get({
                 spreadsheetId: SPREADSHEET_ID,
                 range: `${sheetName}!A2:G141`,
@@ -69,7 +67,17 @@ for (const district of districts) {
 
             const updatedRows = rows.map(row => {
                 const nameInSheet = (row[1] || "").trim();
-                const actualWinner = liveMap[nameInSheet] || row[4] || "";
+                let actualWinner = "";
+                let trailingParty = "";
+
+                if (isReporterSheet) {
+                    const data = liveMap[nameInSheet] || { leading: null, trailing: null };
+                    actualWinner = data.leading || row[4] || "";
+                    trailingParty = data.trailing || "";
+                } else {
+                    // BigTV sheets use a simple string map
+                    actualWinner = liveMap[nameInSheet] || row[4] || "";
+                }
                 
                 const nikhilScore = (actualWinner && row[2] === actualWinner) ? 1 : 0;
                 const janeScore = (actualWinner && row[3] === actualWinner) ? 1 : 0;
@@ -77,6 +85,8 @@ for (const district of districts) {
                 nikhilTotal += nikhilScore;
                 janeTotal += janeScore;
 
+                // If it's the reporter sheet, you could optionally put trailing in Column H
+                // For now, keeping your A-G structure
                 return [row[0], row[1], row[2], row[3], actualWinner, nikhilScore, janeScore];
             });
 
@@ -95,13 +105,14 @@ for (const district of districts) {
             });
         };
 
-        // Run updates
-        await updateSheet('Full_Predictions', bigTvMap);
-        await updateSheet('Differences', bigTvMap);
-        await updateSheet('REPORTER REPORT', reporterMap);
+        // 4. Run Updates
+        await updateSheet('Full_Predictions', bigTvMap, false);
+        await updateSheet('Differences', bigTvMap, false);
+        await updateSheet('REPORTER REPORT', reporterMap, true);
 
-        console.log('✅ All reports updated based on current leaders.');
+        console.log('✅ All reports updated successfully.');
         process.exit(0);
+
     } catch (error) {
         console.error('Workflow Error:', error.message);
         process.exit(1);
