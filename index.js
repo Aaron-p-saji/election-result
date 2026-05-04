@@ -14,90 +14,94 @@ async function updateElectionSheet() {
         });
         const sheets = google.sheets({ version: 'v4', auth });
 
-        // 1. Fetch BigTV Data
+        // 1. Fetch BigTV Data (Malayalam matching)
         console.log('Fetching BigTV results...');
         const bigTvRes = await axios.get(BIGTV_API, {
             headers: { 'Referer': 'https://electionresult.bigtv24x7.com/' }
         });
         const bigTvMap = {};
         bigTvRes.data.forEach(c => {
-            if (c.leadingPosition === "LEADING") bigTvMap[c.constituencyId.nameMl.trim()] = c.partyNameEn;
+            if (c.leadingPosition === "LEADING") {
+                const mlName = (c.constituencyId.nameMl || "").trim();
+                bigTvMap[mlName] = c.partyNameEn;
+            }
         });
 
-        // 2. Fetch Reporter Live Data
+        // 2. Fetch Reporter Live Data (English matching)
         console.log('Fetching Reporter Live results...');
         const reporterRes = await axios.get(REPORTER_API);
         const reporterMap = {};
         
-        // Reporter API combines leads in primary and secondary sliders
-        const allCandidates = [
+        // Combining primary and secondary candidate sliders
+        const reporterCandidates = [
             ...reporterRes.data.data.primary_slider, 
             ...reporterRes.data.data.secondary_slider
         ];
 
-        allCandidates.forEach(c => {
+        reporterCandidates.forEach(c => {
             if (c.status === "leading") {
-                // Using English name for key as it's cleaner in this API's nested object
-                reporterMap[c.constituency_name.trim()] = c.alliance;
+                // Using constituency.name_en specifically for this sheet
+                const enName = (c.constituency.name_en || "").trim();
+                reporterMap[enName] = c.alliance;
             }
         });
 
-        // 3. Process Sheets
-        // BigTV Data sheets
-        const bigTvSheets = ['Full_Predictions', 'Differences'];
-        // New Reporter Live sheet
-        const reporterSheets = ['REPORTER REPORT'];
+        // 3. Helper function to process sheets
+        const updateSheetData = async (sheetName, liveMap) => {
+            const res = await sheets.spreadsheets.values.get({
+                spreadsheetId: SPREADSHEET_ID,
+                range: `${sheetName}!A2:G141`,
+            });
+            const rows = res.data.values;
+            if (!rows) return;
 
-        const processWork = async (targetSheets, liveMap, isEnglishKey) => {
-            for (const sheetName of targetSheets) {
-                const res = await sheets.spreadsheets.values.get({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `${sheetName}!A2:G141`,
-                });
-                const rows = res.data.values;
-                if (!rows) continue;
+            let nikhilTotal = 0;
+            let janeTotal = 0;
 
-                let nikhilTotal = 0;
-                let janeTotal = 0;
+            const updatedRows = rows.map(row => {
+                const constituencyInSheet = (row[1] || "").trim();
+                
+                // Get lead from map or keep current value in Column E
+                const actualWinner = liveMap[constituencyInSheet] || row[4] || "";
+                
+                const nikhilScore = (actualWinner && row[2] === actualWinner) ? 1 : 0;
+                const janeScore = (actualWinner && row[3] === actualWinner) ? 1 : 0;
 
-                const updatedRows = rows.map(row => {
-                    // Match based on Malayalam Name (Col B) for BigTV or English Name for Reporter
-                    const key = isEnglishKey ? (row[138] ? row[1] : row[1]) : row[1]; // Adjusting for your sheet layout
-                    const constituency = (row[1] || "").trim();
-                    
-                    const actualWinner = liveMap[constituency] || row[4] || "";
-                    const nikhilScore = (actualWinner && row[2] === actualWinner) ? 1 : 0;
-                    const janeScore = (actualWinner && row[3] === actualWinner) ? 1 : 0;
+                nikhilTotal += nikhilScore;
+                janeTotal += janeScore;
 
-                    nikhilTotal += nikhilScore;
-                    janeTotal += janeScore;
+                return [row[0], row[1], row[2], row[3], actualWinner, nikhilScore, janeScore];
+            });
 
-                    return [row[0], row[1], row[2], row[3], actualWinner, nikhilScore, janeScore];
-                });
+            // Update main range
+            await sheets.spreadsheets.values.update({
+                spreadsheetId: SPREADSHEET_ID,
+                range: `${sheetName}!A2`,
+                valueInputOption: 'RAW',
+                resource: { values: updatedRows },
+            });
 
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `${sheetName}!A2`,
-                    valueInputOption: 'RAW',
-                    resource: { values: updatedRows },
-                });
-
-                await sheets.spreadsheets.values.update({
-                    spreadsheetId: SPREADSHEET_ID,
-                    range: `${sheetName}!F142:G142`,
-                    valueInputOption: 'RAW',
-                    resource: { values: [[nikhilTotal, janeTotal]] },
-                });
-            }
+            // Update Total Points row
+            await sheets.spreadsheets.values.update({
+                spreadsheetId: SPREADSHEET_ID,
+                range: `${sheetName}!F142:G142`,
+                valueInputOption: 'RAW',
+                resource: { values: [[nikhilTotal, janeTotal]] },
+            });
         };
 
-        await processWork(bigTvSheets, bigTvMap, false); // Match Malayalam for BigTV
-        await processWork(reporterSheets, reporterMap, true); // Match based on names in Reporter sheet
+        // 4. Execute Updates
+        // Update Malayalam sheets from BigTV
+        await updateSheetData('Full_Predictions', bigTvMap);
+        await updateSheetData('Differences', bigTvMap);
 
-        console.log('✅ All sheets (including REPORTER REPORT) updated.');
+        // Update English sheet from Reporter Live
+        await updateSheetData('REPORTER REPORT', reporterMap);
+
+        console.log('✅ All sheets updated successfully.');
         process.exit(0);
     } catch (error) {
-        console.error('API Error:', error.message);
+        console.error('Update Failed:', error.message);
         process.exit(1);
     }
 }
