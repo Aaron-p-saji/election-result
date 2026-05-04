@@ -2,8 +2,8 @@ const axios = require('axios');
 const { google } = require('googleapis');
 
 const SPREADSHEET_ID = '1dHBQs3lrndB83y24E-424AUfXUnfESzKZV8PYqMoDCc';
-// Update this to the exact API endpoint you found in the Network tab
-const API_URL = 'https://bigtv-election.onrender.com/api/candidates/results?t=1777865655678'; 
+// Using the exact API URL from your debug log
+const API_URL = 'https://bigtv-election.onrender.com/api/candidates/results'; 
 
 async function updateElectionSheet() {
     try {
@@ -14,18 +14,26 @@ async function updateElectionSheet() {
         });
         const sheets = google.sheets({ version: 'v4', auth });
 
-        console.log('Fetching live JSON data from Big TV...');
-        const { data } = await axios.get(API_URL);
+        console.log('Fetching live results from BigTV API...');
+        
+        const { data } = await axios.get(API_URL, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+                'Origin': 'https://electionresult.bigtv24x7.com',
+                'Referer': 'https://electionresult.bigtv24x7.com/',
+                'Accept': 'application/json, text/plain, */*',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache'
+            }
+        });
 
-        // Map live results: { "Manalur": "LDF", "Mananthavady": "UDF", ... }
+        // Map live results: { "Manjeshwar": "LDF", ... }
         const liveResultsMap = {};
-
         data.forEach(candidate => {
-            // We only care about the candidate currently marked as LEADING
             if (candidate.leadingPosition === "LEADING") {
                 const constituency = candidate.constituencyId.nameEn;
                 const party = candidate.partyNameEn;
-                liveResultsMap[constituency] = party;
+                if (constituency) liveResultsMap[constituency] = party;
             }
         });
 
@@ -44,14 +52,12 @@ async function updateElectionSheet() {
             let janeTotal = 0;
 
             const updatedRows = rows.map(row => {
-                const constituency = row[1]; // Column B (English Name)
-                const nikhilPred = row[2];   // Column C
-                const janePred = row[3];     // Column D
+                const constituency = row[1]; 
+                const nikhilPred = row[2];   
+                const janePred = row[3];     
                 
-                // Get leading party from JSON map, or keep existing value
                 const actualWinner = liveResultsMap[constituency] || row[4] || "";
                 
-                // Score calculation
                 const nikhilScore = (actualWinner && nikhilPred === actualWinner) ? 1 : 0;
                 const janeScore = (actualWinner && janePred === actualWinner) ? 1 : 0;
 
@@ -61,7 +67,6 @@ async function updateElectionSheet() {
                 return [row[0], constituency, nikhilPred, janePred, actualWinner, nikhilScore, janeScore];
             });
 
-            // Write updated rows back to the sheet
             await sheets.spreadsheets.values.update({
                 spreadsheetId: SPREADSHEET_ID,
                 range: `${sheetName}!A2`,
@@ -69,7 +74,6 @@ async function updateElectionSheet() {
                 resource: { values: updatedRows },
             });
 
-            // Update Total Points at the bottom
             await sheets.spreadsheets.values.update({
                 spreadsheetId: SPREADSHEET_ID,
                 range: `${sheetName}!F142:G142`,
@@ -78,10 +82,10 @@ async function updateElectionSheet() {
             });
         }
 
-        console.log(`✅ Success! Processed ${Object.keys(liveResultsMap).length} leads.`);
+        console.log(`✅ Update successful. Processed ${Object.keys(liveResultsMap).length} leads.`);
         process.exit(0);
     } catch (error) {
-        console.error('Scraper Error:', error.message);
+        console.error('Error:', error.response ? `Status ${error.response.status}` : error.message);
         process.exit(1);
     }
 }
