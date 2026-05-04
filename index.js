@@ -7,118 +7,109 @@ const BIGTV_API = 'https://bigtv-election.onrender.com/api/candidates/results';
 const REPORTER_SUMMARY_API = 'https://election.reporterlive.com/api/widget/election-2026/summary';
 const REPORTER_CONSTITUENCY_BASE = 'https://election.reporterlive.com/api/widget/election-2026/constituency/';
 
-const SPECIFIC_SLUGS = [
-    'perambra', 'thiruvambady', 'thavanur', 'pattambi', 'kodungallur', 
-    'vypen', 'kochi', 'changanassery', 'kuttanad', 'kayamkulam', 
-    'adoor', 'kazhakkoottam', 'vattiyoorkavu', 'thiruvananthapuram'
-];
-
 async function updateElectionSheet() {
     try {
         const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
         const auth = new google.auth.GoogleAuth({
-            credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+            credentials,
+            scopes: ['https://www.googleapis.com/auth/spreadsheets'],
         });
         const sheets = google.sheets({ version: 'v4', auth });
 
-        // 1. Fetch BigTV Data (Primary source for Malayalam sheets)
+        // 1. Fetch BigTV Data (Primary Map)
         const bigTvRes = await axios.get(BIGTV_API, { headers: { 'Referer': 'https://electionresult.bigtv24x7.com/' } });
         const bigTvMap = {};
         bigTvRes.data.forEach(c => {
             if (c.leadingPosition === "LEADING") bigTvMap[c.constituencyId.nameMl.trim()] = c.partyNameEn;
         });
 
-        // 2. Fetch Reporter Live Data & Create Language Bridge
+        // 2. Fetch Reporter Live Summary & Build Language Bridge
         console.log('Fetching Reporter Live data...');
         const reporterSummary = await axios.get(REPORTER_SUMMARY_API);
         const summaryData = reporterSummary.data.data;
         const summaryWinners = summaryData.winners_by_slug || {};
         
-        const reporterMapEn = {}; // Key: English Name
-        const reporterMapMl = {}; // Key: Malayalam Name
-        const allConsts = summaryData.districts.flatMap(d => d.constituencies);
-
-        // Process all 140 constituencies for the Full sheet
-        // We use the winners_by_slug first
-        for (const [slug, alliance] of Object.entries(summaryWinners)) {
-            const detail = allConsts.find(c => c.slug === slug);
-            if (detail) {
-                // We don't have Malayalam names in the basic constituency list, 
-                // so we fetch them from the slider data or the detailed API if needed.
-                reporterMapEn[detail.name_en.trim()] = alliance;
+        // This map will help us find the English slug using the Malayalam name from your sheet
+        const mlToSlugMap = {};
+        const slugToEnName = {};
+        
+        // Primary and Secondary sliders usually contain the Malayalam names
+        const allCandidates = [...summaryData.primary_slider, ...summaryData.secondary_slider];
+        allCandidates.forEach(cand => {
+            const mlName = cand.name_ml || cand.constituency.name_ml;
+            if (mlName) {
+                mlToSlugMap[mlName.trim()] = cand.constituency.slug;
+                slugToEnName[cand.constituency.slug] = cand.constituency.name_en;
             }
+        });
+
+        // 3. Process the "NEW" Sheet (140 Rows)
+        const sheetName = 'NEW';
+        const res = await sheets.spreadsheets.values.get({
+            spreadsheetId: SPREADSHEET_ID,
+            range: `${sheetName}!A2:G141`,
+        });
+        
+        const rows = res.data.values;
+        if (!rows) {
+            console.log('Sheet NEW is empty or range A2:G141 not found.');
+            return;
         }
 
-        // Deep dive for the 14 Specific Slugs (Reporter Report Sheet)
-        for (const slug of SPECIFIC_SLUGS) {
-            try {
-                const detailRes = await axios.get(`${REPORTER_CONSTITUENCY_BASE}${slug}`);
-                const data = detailRes.data.data;
-                const winner = data.candidates.find(c => c.status === "won" || c.status === "leading");
-                
-                if (winner) {
-                    reporterMapEn[data.name_en.trim()] = winner.alliance;
-                    // Bridge to Malayalam for the Full Predictions sheet
-                    const mlName = data.candidates[0].constituency.name_ml || ""; 
-                    if (mlName) reporterMapMl[mlName.trim()] = winner.alliance;
-                }
-            } catch (e) { console.log(`Detail fetch failed for ${slug}`); }
+        let nTotal = 0, jTotal = 0;
+        const updatedRows = [];
+
+        for (const row of rows) {
+            const mlNameInSheet = (row[1] || "").trim();
+            const slug = mlToSlugMap[mlNameInSheet];
+            
+            // PRIORITY 1: BigTV (Malayalam Match)
+            let winnerAlliance = bigTvMap[mlNameInSheet];
+
+            // PRIORITY 2: Reporter Live winners_by_slug
+            if (!winnerAlliance && slug && summaryWinners[slug]) {
+                winnerAlliance = summaryWinners[slug];
+            }
+
+            // PRIORITY 3: Deep Dive for specific slug if no winner yet
+            if (!winnerAlliance && slug) {
+                try {
+                    const detail = await axios.get(`${REPORTER_CONSTITUENCY_BASE}${slug}`);
+                    const cand = detail.data.data.candidates.find(c => c.status === "won" || c.status === "leading");
+                    if (cand) winnerAlliance = cand.alliance;
+                } catch (e) { /* ignore detail fail */ }
+            }
+
+            // Fallback to existing value if still nothing
+            const finalWinner = winnerAlliance || row[4] || "";
+            
+            const nScore = (finalWinner && row[2] === finalWinner) ? 1 : 0;
+            const jScore = (finalWinner && row[3] === finalWinner) ? 1 : 0;
+            nTotal += nScore; jTotal += jScore;
+
+            updatedRows.push([row[0], row[1], row[2], row[3], finalWinner, nScore, jScore]);
         }
 
-        // 3. Update Function
-        const processSheet = async (sheetName, isReporterSheet) => {
-            console.log(`Updating ${sheetName}...`);
-            const res = await sheets.spreadsheets.values.get({
-                spreadsheetId: SPREADSHEET_ID,
-                range: `${sheetName}!A2:G141`,
-            });
-            const rows = res.data.values;
-            if (!rows) return;
+        // 4. Update the "NEW" Sheet
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: SPREADSHEET_ID,
+            range: `${sheetName}!A2`,
+            valueInputOption: 'RAW',
+            resource: { values: updatedRows },
+        });
 
-            let nTotal = 0, jTotal = 0;
-            const updatedRows = rows.map(row => {
-                const nameInSheet = (row[1] || "").trim();
-                let actualWinner = row[4] || "";
+        // Update Total Points Row for NEW sheet
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: SPREADSHEET_ID,
+            range: `${sheetName}!F142:G142`,
+            valueInputOption: 'RAW',
+            resource: { values: [[nTotal, jTotal]] },
+        });
 
-                if (isReporterSheet) {
-                    // REPORTER REPORT uses English names
-                    actualWinner = reporterMapEn[nameInSheet] || row[4] || "";
-                } else {
-                    // Full_Predictions & Differences use Malayalam names
-                    // Priority: BigTV -> Reporter Malayalam Bridge -> Current Value
-                    actualWinner = bigTvMap[nameInSheet] || reporterMapMl[nameInSheet] || row[4] || "";
-                }
-
-                const nScore = (actualWinner && row[2] === actualWinner) ? 1 : 0;
-                const jScore = (actualWinner && row[3] === actualWinner) ? 1 : 0;
-                nTotal += nScore; jTotal += jScore;
-
-                return [row[0], row[1], row[2], row[3], actualWinner, nScore, jScore];
-            });
-
-            await sheets.spreadsheets.values.update({
-                spreadsheetId: SPREADSHEET_ID,
-                range: `${sheetName}!A2`,
-                valueInputOption: 'RAW',
-                resource: { values: updatedRows },
-            });
-            await sheets.spreadsheets.values.update({
-                spreadsheetId: SPREADSHEET_ID,
-                range: `${sheetName}!F142:G142`,
-                valueInputOption: 'RAW',
-                resource: { values: [[nTotal, jTotal]] },
-            });
-        };
-
-        // 4. Execution
-        await processSheet('Full_Predictions', false);
-        await processSheet('Differences', false);
-        await processSheet('REPORTER REPORT', true);
-
-        console.log('✅ All 140 constituencies and special reports updated.');
+        console.log('✅ Sheet "NEW" updated for all 140 constituencies.');
         process.exit(0);
     } catch (error) {
-        console.error('Error:', error.message);
+        console.error('Critical Error:', error.message);
         process.exit(1);
     }
 }
