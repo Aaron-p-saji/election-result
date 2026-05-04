@@ -2,7 +2,6 @@ const axios = require('axios');
 const { google } = require('googleapis');
 
 const SPREADSHEET_ID = '1dHBQs3lrndB83y24E-424AUfXUnfESzKZV8PYqMoDCc';
-// Using the exact API URL from your debug log
 const API_URL = 'https://bigtv-election.onrender.com/api/candidates/results'; 
 
 async function updateElectionSheet() {
@@ -21,19 +20,19 @@ async function updateElectionSheet() {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
                 'Origin': 'https://electionresult.bigtv24x7.com',
                 'Referer': 'https://electionresult.bigtv24x7.com/',
-                'Accept': 'application/json, text/plain, */*',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache'
+                'Accept': 'application/json, text/plain, */*'
             }
         });
 
-        // Map live results: { "Manjeshwar": "LDF", ... }
+        // Map live results using nameMl: { "അടൂർ": "LDF", "പേരാമ്പ്ര": "LDF", ... }
         const liveResultsMap = {};
         data.forEach(candidate => {
             if (candidate.leadingPosition === "LEADING") {
-                const constituency = candidate.constituencyId.nameEn;
-                const party = candidate.partyNameEn;
-                if (constituency) liveResultsMap[constituency] = party;
+                const constituencyMl = candidate.constituencyId.nameMl;
+                const party = candidate.partyNameEn; // Using LDF, UDF, NDA for matching
+                if (constituencyMl) {
+                    liveResultsMap[constituencyMl] = party;
+                }
             }
         });
 
@@ -52,21 +51,26 @@ async function updateElectionSheet() {
             let janeTotal = 0;
 
             const updatedRows = rows.map(row => {
-                const constituency = row[1]; 
-                const nikhilPred = row[2];   
-                const janePred = row[3];     
+                const constituencyName = row[1]; // Column B (Malayalam Name)
+                const nikhilPred = row[2];      // Column C
+                const janePred = row[3];        // Column D
                 
-                const actualWinner = liveResultsMap[constituency] || row[4] || "";
+                // 1. Get winner from API map using Malayalam name
+                // 2. Fallback to existing value in Column E if API has no lead yet
+                const actualWinner = liveResultsMap[constituencyName] || row[4] || "";
                 
+                // Scoring Logic
                 const nikhilScore = (actualWinner && nikhilPred === actualWinner) ? 1 : 0;
                 const janeScore = (actualWinner && janePred === actualWinner) ? 1 : 0;
 
                 nikhilTotal += nikhilScore;
                 janeTotal += janeScore;
 
-                return [row[0], constituency, nikhilPred, janePred, actualWinner, nikhilScore, janeScore];
+                // Update Row: [SL, Name, NikPred, JanePred, Winner, NikScore, JaneScore]
+                return [row[0], constituencyName, nikhilPred, janePred, actualWinner, nikhilScore, janeScore];
             });
 
+            // Update data rows
             await sheets.spreadsheets.values.update({
                 spreadsheetId: SPREADSHEET_ID,
                 range: `${sheetName}!A2`,
@@ -74,6 +78,7 @@ async function updateElectionSheet() {
                 resource: { values: updatedRows },
             });
 
+            // Update Total Points Row (Assuming Row 142)
             await sheets.spreadsheets.values.update({
                 spreadsheetId: SPREADSHEET_ID,
                 range: `${sheetName}!F142:G142`,
@@ -82,7 +87,7 @@ async function updateElectionSheet() {
             });
         }
 
-        console.log(`✅ Update successful. Processed ${Object.keys(liveResultsMap).length} leads.`);
+        console.log(`✅ Update successful. Current leads found: ${Object.keys(liveResultsMap).length}`);
         process.exit(0);
     } catch (error) {
         console.error('Error:', error.response ? `Status ${error.response.status}` : error.message);
