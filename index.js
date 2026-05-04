@@ -17,111 +17,108 @@ async function updateElectionSheet() {
     try {
         const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
         const auth = new google.auth.GoogleAuth({
-            credentials,
-            scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+            credentials, scopes: ['https://www.googleapis.com/auth/spreadsheets'],
         });
         const sheets = google.sheets({ version: 'v4', auth });
 
-        // 1. Fetch BigTV Data
+        // 1. Fetch BigTV Data (Primary source for Malayalam sheets)
         const bigTvRes = await axios.get(BIGTV_API, { headers: { 'Referer': 'https://electionresult.bigtv24x7.com/' } });
         const bigTvMap = {};
         bigTvRes.data.forEach(c => {
             if (c.leadingPosition === "LEADING") bigTvMap[c.constituencyId.nameMl.trim()] = c.partyNameEn;
         });
 
-        // 2. Fetch Reporter & ECI Data
-        console.log('Fetching Election Data...');
+        // 2. Fetch Reporter Live Data & Create Language Bridge
+        console.log('Fetching Reporter Live data...');
         const reporterSummary = await axios.get(REPORTER_SUMMARY_API);
         const summaryData = reporterSummary.data.data;
         const summaryWinners = summaryData.winners_by_slug || {};
-        const reporterMap = {};
-
-        // Flatten all constituencies from all districts to find IDs/Slugs easily
+        
+        const reporterMapEn = {}; // Key: English Name
+        const reporterMapMl = {}; // Key: Malayalam Name
         const allConsts = summaryData.districts.flatMap(d => d.constituencies);
 
-        for (const slug of SPECIFIC_SLUGS) {
-            const constObj = allConsts.find(c => c.slug === slug);
-            if (!constObj) continue;
-
-            let winnerAlliance = summaryWinners[slug];
-
-            // If Summary has no winner, check Reporter Detail
-            if (!winnerAlliance) {
-                try {
-                    const detail = await axios.get(`${REPORTER_CONSTITUENCY_BASE}${slug}`);
-                    const cand = detail.data.data.candidates.find(c => c.status === "won" || c.status === "leading");
-                    if (cand) winnerAlliance = cand.alliance;
-                } catch (e) { console.log(`Reporter detail fail for ${slug}`); }
-            }
-
-            // If still no winner, fallback to ECI Scraper
-            if (!winnerAlliance) {
-                try {
-                    const eciUrl = `https://results.eci.gov.in/ResultAcGenMay2026/candidateswise-S11${constObj.id}.htm`;
-                    const eciRes = await axios.get(eciUrl);
-                    const $ = cheerio.load(eciRes.data);
-                    const leadingBox = $('.cand-box').filter((i, el) => {
-                        const txt = $(el).find('.status').text().toLowerCase();
-                        return txt.includes('leading') || txt.includes('won');
-                    });
-
-                    console.log(`ECI ini for ${constObj.id}`);
-
-                    if (leadingBox.length > 0) {
-                        const party = leadingBox.find('.nme-prty h6').text().trim();
-                        if (party.includes('National Congress')) winnerAlliance = 'UDF';
-                        else if (party.includes('Communist') || party.includes('LDF')) winnerAlliance = 'LDF';
-                        else if (party.includes('Bharatiya Janata') || party.includes('NDA')) winnerAlliance = 'NDA';
-                        else if (party.includes('Kerala Congress')) winnerAlliance = 'UDF';
-                    }
-                } catch (e) { console.log(`ECI fail for ${constObj.id}`); }
-            }
-
-            if (winnerAlliance) {
-                reporterMap[constObj.name_en.trim()] = winnerAlliance;
+        // Process all 140 constituencies for the Full sheet
+        // We use the winners_by_slug first
+        for (const [slug, alliance] of Object.entries(summaryWinners)) {
+            const detail = allConsts.find(c => c.slug === slug);
+            if (detail) {
+                // We don't have Malayalam names in the basic constituency list, 
+                // so we fetch them from the slider data or the detailed API if needed.
+                reporterMapEn[detail.name_en.trim()] = alliance;
             }
         }
 
-        // 3. Update Sheet Logic
-        const processSheet = async (name, liveMap, isReporter) => {
-            const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${name}!A2:G141` });
+        // Deep dive for the 14 Specific Slugs (Reporter Report Sheet)
+        for (const slug of SPECIFIC_SLUGS) {
+            try {
+                const detailRes = await axios.get(`${REPORTER_CONSTITUENCY_BASE}${slug}`);
+                const data = detailRes.data.data;
+                const winner = data.candidates.find(c => c.status === "won" || c.status === "leading");
+                
+                if (winner) {
+                    reporterMapEn[data.name_en.trim()] = winner.alliance;
+                    // Bridge to Malayalam for the Full Predictions sheet
+                    const mlName = data.candidates[0].constituency.name_ml || ""; 
+                    if (mlName) reporterMapMl[mlName.trim()] = winner.alliance;
+                }
+            } catch (e) { console.log(`Detail fetch failed for ${slug}`); }
+        }
+
+        // 3. Update Function
+        const processSheet = async (sheetName, isReporterSheet) => {
+            console.log(`Updating ${sheetName}...`);
+            const res = await sheets.spreadsheets.values.get({
+                spreadsheetId: SPREADSHEET_ID,
+                range: `${sheetName}!A2:G141`,
+            });
             const rows = res.data.values;
             if (!rows) return;
 
             let nTotal = 0, jTotal = 0;
-            const updated = rows.map(row => {
-                const sheetName = (row[1] || "").trim();
-                const winner = isReporter ? (reporterMap[sheetName] || row[4] || "") : (liveMap[sheetName] || row[4] || "");
-                
-                const nScore = (winner && row[2] === winner) ? 1 : 0;
-                const jScore = (winner && row[3] === winner) ? 1 : 0;
+            const updatedRows = rows.map(row => {
+                const nameInSheet = (row[1] || "").trim();
+                let actualWinner = row[4] || "";
+
+                if (isReporterSheet) {
+                    // REPORTER REPORT uses English names
+                    actualWinner = reporterMapEn[nameInSheet] || row[4] || "";
+                } else {
+                    // Full_Predictions & Differences use Malayalam names
+                    // Priority: BigTV -> Reporter Malayalam Bridge -> Current Value
+                    actualWinner = bigTvMap[nameInSheet] || reporterMapMl[nameInSheet] || row[4] || "";
+                }
+
+                const nScore = (actualWinner && row[2] === actualWinner) ? 1 : 0;
+                const jScore = (actualWinner && row[3] === actualWinner) ? 1 : 0;
                 nTotal += nScore; jTotal += jScore;
 
-                return [row[0], row[1], row[2], row[3], winner, nScore, jScore];
+                return [row[0], row[1], row[2], row[3], actualWinner, nScore, jScore];
             });
 
             await sheets.spreadsheets.values.update({
                 spreadsheetId: SPREADSHEET_ID,
-                range: `${name}!A2`,
+                range: `${sheetName}!A2`,
                 valueInputOption: 'RAW',
-                resource: { values: updated }
+                resource: { values: updatedRows },
             });
             await sheets.spreadsheets.values.update({
                 spreadsheetId: SPREADSHEET_ID,
-                range: `${name}!F142:G142`,
+                range: `${sheetName}!F142:G142`,
                 valueInputOption: 'RAW',
-                resource: { values: [[nTotal, jTotal]] }
+                resource: { values: [[nTotal, jTotal]] },
             });
         };
 
-        await processSheet('Full_Predictions', bigTvMap, false);
-        await processSheet('Differences', bigTvMap, false);
-        await processSheet('REPORTER REPORT', null, true);
+        // 4. Execution
+        await processSheet('Full_Predictions', false);
+        await processSheet('Differences', false);
+        await processSheet('REPORTER REPORT', true);
 
-        console.log('✅ Update Complete');
+        console.log('✅ All 140 constituencies and special reports updated.');
         process.exit(0);
     } catch (error) {
-        console.error('Critical Error:', error.message);
+        console.error('Error:', error.message);
         process.exit(1);
     }
 }
