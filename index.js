@@ -27,11 +27,13 @@ async function updateElectionSheet() {
         // Map live results using nameMl: { "അടൂർ": "LDF", "പേരാമ്പ്ര": "LDF", ... }
         const liveResultsMap = {};
         data.forEach(candidate => {
+            // Check if this candidate is currently leading
             if (candidate.leadingPosition === "LEADING") {
                 const constituencyMl = candidate.constituencyId.nameMl;
-                const party = candidate.partyNameEn; // Using LDF, UDF, NDA for matching
+                const partyEn = candidate.partyNameEn; // This gives 'LDF', 'UDF', or 'NDA'
+                
                 if (constituencyMl) {
-                    liveResultsMap[constituencyMl] = party;
+                    liveResultsMap[constituencyMl] = partyEn;
                 }
             }
         });
@@ -39,6 +41,7 @@ async function updateElectionSheet() {
         const sheetNames = ['Full_Predictions', 'Differences'];
 
         for (const sheetName of sheetNames) {
+            // Read the data range (Columns A to G)
             const res = await sheets.spreadsheets.values.get({
                 spreadsheetId: SPREADSHEET_ID,
                 range: `${sheetName}!A2:G141`,
@@ -51,26 +54,26 @@ async function updateElectionSheet() {
             let janeTotal = 0;
 
             const updatedRows = rows.map(row => {
-                const constituencyName = row[1]; // Column B (Malayalam Name)
-                const nikhilPred = row[2];      // Column C
-                const janePred = row[3];        // Column D
+                const constituencyMlName = row[1]; // Column B (Malayalam Name)
+                const nikhilPred = row[2];         // Column C
+                const janePred = row[3];           // Column D
                 
-                // 1. Get winner from API map using Malayalam name
-                // 2. Fallback to existing value in Column E if API has no lead yet
-                const actualWinner = liveResultsMap[constituencyName] || row[4] || "";
+                // 1. Check if the API has a leading party for this Malayalam name
+                // 2. Fallback to the current value in Column E if no lead is found yet
+                const actualWinner = liveResultsMap[constituencyMlName] || row[4] || "";
                 
-                // Scoring Logic
+                // Score Logic: 1 point if the prediction exactly matches the leading party
                 const nikhilScore = (actualWinner && nikhilPred === actualWinner) ? 1 : 0;
                 const janeScore = (actualWinner && janePred === actualWinner) ? 1 : 0;
 
                 nikhilTotal += nikhilScore;
                 janeTotal += janeScore;
 
-                // Update Row: [SL, Name, NikPred, JanePred, Winner, NikScore, JaneScore]
-                return [row[0], constituencyName, nikhilPred, janePred, actualWinner, nikhilScore, janeScore];
+                // Return the updated row format
+                return [row[0], constituencyMlName, nikhilPred, janePred, actualWinner, nikhilScore, janeScore];
             });
 
-            // Update data rows
+            // Update the main data rows (A2:G141)
             await sheets.spreadsheets.values.update({
                 spreadsheetId: SPREADSHEET_ID,
                 range: `${sheetName}!A2`,
@@ -78,7 +81,7 @@ async function updateElectionSheet() {
                 resource: { values: updatedRows },
             });
 
-            // Update Total Points Row (Assuming Row 142)
+            // Update Total Points Row (Updating only Columns F and G at the bottom)
             await sheets.spreadsheets.values.update({
                 spreadsheetId: SPREADSHEET_ID,
                 range: `${sheetName}!F142:G142`,
@@ -87,10 +90,10 @@ async function updateElectionSheet() {
             });
         }
 
-        console.log(`✅ Update successful. Current leads found: ${Object.keys(liveResultsMap).length}`);
+        console.log(`✅ Success! Data updated for ${Object.keys(liveResultsMap).length} constituencies.`);
         process.exit(0);
     } catch (error) {
-        console.error('Error:', error.response ? `Status ${error.response.status}` : error.message);
+        console.error('Update Error:', error.message);
         process.exit(1);
     }
 }
