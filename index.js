@@ -30,22 +30,30 @@ async function updateElectionSheet() {
         // Reporter API structure: districts -> constituencies -> slug
         const districts = reporterSummary.data.data.districts;
         
-        for (const district of districts) {
-            for (const constInfo of district.constituencies) {
-                try {
-                    // Fetch detailed data for each slug to find the ACTUAL leader
-                    const detailRes = await axios.get(`${REPORTER_CONSTITUENCY_BASE}${constInfo.slug}`);
-                    const candidates = detailRes.data.data.candidates;
-                    
-                    // Find the one where status is "leading"
-                    const leader = candidates.find(cand => cand.status === "leading");
-                    if (leader) {
-                        reporterMap[constInfo.name_en.trim()] = leader.alliance;
-                    }
-                } catch (e) {
-                    console.error(`Could not fetch details for ${constInfo.slug}`);
-                }
-            }
+        // Map live results to find BOTH leader and trailer
+const liveResultsMap = {};
+
+for (const district of districts) {
+    for (const constInfo of district.constituencies) {
+        try {
+            const detailRes = await axios.get(`${REPORTER_CONSTITUENCY_BASE}${constInfo.slug}`);
+            const candidates = detailRes.data.data.candidates;
+            
+            // Find the candidate explicitly marked as "leading"
+            const leader = candidates.find(cand => cand.status === "leading");
+            // Find the candidate explicitly marked as "trailing"
+            const trailer = candidates.find(cand => cand.status === "trailing");
+
+            // Store both in the map for the constituency
+            reporterMap[constInfo.name_en.trim()] = {
+                leading: leader ? leader.alliance : "N/A",
+                trailing: trailer ? trailer.alliance : "N/A"
+            };
+        } catch (e) {
+            console.error(`Could not fetch details for ${constInfo.slug}`);
+        }
+    }
+}
         }
 
         // 3. Update Sheets
